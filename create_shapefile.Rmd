@@ -1,0 +1,321 @@
+---
+title: "Delineating the neighborhoods of Magude"
+subtitle: "A programmatic approach"
+author: "Joe Brew, Bea Galatas, Humberto Munguambe, Amone Felimone, Pedro Aide"
+date: "`r Sys.Date()`"
+output:
+  tufte::tufte_html: default
+  tufte::tufte_handout:
+    citation_package: natbib
+    latex_engine: xelatex
+  tufte::tufte_book:
+    citation_package: natbib
+    latex_engine: xelatex
+bibliography: bibliography.bib
+link-citations: yes
+---
+
+```{r setup, include=FALSE}
+library(tufte)
+# invalidate cache when the tufte version changes
+knitr::opts_chunk$set(tidy = FALSE, cache.extra = packageVersion('tufte'))
+options(htmltools.dir.version = FALSE)
+```
+
+```{r}
+knitr::opts_chunk$set(comment = NA, 
+               echo = TRUE, 
+               warning = FALSE, 
+               message = FALSE, 
+               error = TRUE, 
+               cache = FALSE)
+```
+
+## Overview
+
+This document provides a simple overview of an approach for creating neighborhood^[bairro] delineations using point data. Though the specific application here is for the MALTEM project in the district of Magude, the approach is generalizable to other areas. This document provides both explanation as well as code.
+
+## Workspace preparation
+
+First, we prepare our workspace by attaching several libraries.
+
+```{r}
+library(dplyr)
+library(sp)
+library(cism)
+library(rgeos)
+library(geosphere)
+library(readxl)
+```
+
+We then load up our point data (the houses of the census of Magude). In the below, we use the `cism` package^[www.github.com/joebrew/cism] to quickly access the MALTEM database.
+
+```{r}
+if('2016-12-07_HOUSEHOLD.RData' %in% dir('data')){
+  load('data/2016-12-07_HOUSEHOLD.RData')
+} else {
+  HOUSEHOLD <- get_data(dbname = 'MALTEM',
+                tab = 'HOUSEHOLD')
+  save(HOUSEHOLD,
+       file = 'data/2016-12-07_HOUSEHOLD.RData')
+}
+```
+
+Next, we read in the dictionary of neighborhood numbers/names prepared by Humberto.
+
+
+```{r}
+# Read in the bairros names
+dict <- read_excel('public_data/lista total de agregados por bairro.xlsx',
+                   skip = 1)
+```
+
+We then carry out some straightforward "cleaning".
+
+```{r}
+# Get a bairro number
+dict$bairro_number <- 
+  as.numeric(unlist(lapply(dict$`Cod do Bairro`,
+                           function(x){
+                             substr(x, 3, 4)
+                           })))
+
+# Clean up names and narrow
+dict <- dict %>%
+  dplyr::select(bairro_number,
+                `posto Administrativo`,
+                Bairros) %>%
+  rename(posto_administrativo = `posto Administrativo`,
+         bairro_name = Bairros)
+
+# Get shorter name
+df <- HOUSEHOLD
+
+# Specify coordinates
+df$lng <- df$HOUSEHOLD_HEAD_GPS_LNG
+df$lat <- df$HOUSEHOLD_HEAD_GPS_LAT
+
+# Get neighborhood number
+df$bairro_number <-
+  unlist(lapply(df$HOUSEHOLD_HEAD_AGREG_NUM,
+                function(x){
+                  substr(x, 3,4)
+                }))
+df$bairro_number <- as.numeric(as.character(df$bairro_number))
+
+# Narrow data
+df <- df %>%
+  dplyr::select(bairro_number,
+                lng,
+                lat) %>%
+  mutate(x = lng,
+         y = lat) %>%
+  filter(!is.na(lng),
+         !is.na(lat))
+```
+
+## Spatial operations
+
+Once we have our point data read in, we make a spatial object.
+
+```{r}
+
+# Make spatial
+coordinates(df) <- ~x+y
+proj4string(df) <- proj4string(mag2)
+```
+
+Since some points are likely incorrect (and this can throw off our estimates by creating artificially small or large neighborhoods), we keep only those points which are closest to the others which are supposedly in the same neighborhood. 
+
+```{r}
+df@data$id <- 1:nrow(df)
+df@data$suspect <- FALSE
+
+# Get unique bairros
+bairros <- data_frame(bairro_number = sort(unique(df$bairro_number)))
+
+# Remove form our household data, those points which 
+# are suspiciously far from others
+for (i in 1:nrow(bairros)){
+  # Get info just for this bairro
+  this_bairro <- bairros$bairro_number[i]
+  sub_df <- df[df@data$bairro_number == this_bairro,]
+  # Get distances between points
+  distances <- geosphere::distm(sub_df, fun = distVincentySphere)
+  median_distances <- apply(distances, 1, function(x){quantile(x, 0.75, na.rm = TRUE)})
+  # Keep only the closest 50 percent
+  close_cluster <- sub_df[which(median_distances <= median(median_distances, na.rm = TRUE)),]
+  # Flag those which are suspicious
+  far_cluster <- sub_df[which(median_distances > median(median_distances, na.rm = TRUE)),]
+  df$suspect[df$id %in% far_cluster$id] <- TRUE
+}
+
+# Remove those which are suspicious
+df <- df[!df@data$suspect,]
+```
+
+Having now filtered out the 50% of points deemed to be most "suspicious", we get the centroid of each neighborhood.
+
+```{r}
+# Get centroids
+bairros$x <- bairros$y <- NA
+for (i in 1:nrow(bairros)){
+  # Get info just for this bairro
+  this_bairro <- bairros$bairro_number[i]
+  sub_df <- df[df@data$bairro_number == this_bairro,]
+  bairros$x[i] <- mean(sub_df$lng, na.rm = TRUE)
+  bairros$y[i] <- mean(sub_df$lat, na.rm = TRUE)
+}
+```
+
+### Convex hulls, delaunay tesselation, and voronoi polygons
+
+A neighborhood, per our methodology, is the convex hull^[outer border] of all its constituents, as well as any point (theoretical or observed) which is closer to that convex hull than to any other convex hull. In order to calculate these borders, we use delaunay triangulation to establish cut-offs, before forming voronoi polygons as our neighborhoods.
+
+```{r}
+# Create convex hulls
+ch <- list()
+for (i in 1:nrow(bairros)){
+  this_bairro <- bairros$bairro_number[i]
+  sub_df <- df[df@data$bairro_number == this_bairro,]
+  x <- rgeos::gConvexHull(sub_df)
+  ch[[i]] <- x
+}
+
+# Create delaunay triangulation / voronoi tiles for entire surface
+voronoi <- function(shp = df){
+  
+  shp@data <- data.frame(shp@data)
+  
+  # Fix row names
+  row.names(shp) <- 1:nrow(shp)
+  
+  # Remove any identical ones
+  shp <- shp[!duplicated(shp$lng,
+                                                     shp$lat),]
+  
+  # Helper function to create coronoi polygons (tesselation, not delaunay triangles)
+  # http://carsonfarmer.com/2009/09/voronoi-polygons-with-r/
+  voronoipolygons = function(layer) {
+    require(deldir)
+    crds = layer@coords
+    z = deldir(crds[,1], crds[,2])
+    w = tile.list(z)
+    polys = vector(mode='list', length=length(w))
+    require(sp)
+    for (i in seq(along=polys)) {
+      pcrds = cbind(w[[i]]$x, w[[i]]$y)
+      pcrds = rbind(pcrds, pcrds[1,])
+      polys[[i]] = Polygons(list(Polygon(pcrds)), ID=as.character(i))
+    }
+    SP = SpatialPolygons(polys)
+    voronoi = SpatialPolygonsDataFrame(SP, data=data.frame(x=crds[,1], 
+                                                           y=crds[,2], row.names=sapply(slot(SP, 'polygons'), 
+                                                                                        function(x) slot(x, 'ID'))))
+  }
+  # http://gis.stackexchange.com/questions/180682/merge-a-list-of-spatial-polygon-objects-in-r
+  appendSpatialPolygons <- function(x) {
+    ## loop over list of polygons
+    for (i in 2:length(x)) {
+      # create initial output polygon
+      if (i == 2) {
+        out <- maptools::spRbind(x[[i-1]], x[[i]])
+        # append all following polygons to output polygon  
+      } else {
+        out <- maptools::spRbind(out, x[[i]])
+      }
+    }
+    return(out)
+  }
+  
+  tile_polys <- voronoipolygons(shp)
+  # Add the bairro numbers
+  tile_polys@data$bairro_number <- the_bairros <- shp$bairro_number
+  cols <- rainbow(as.numeric(factor(tile_polys@data$bairro_number)))
+  
+  # Disolve borders
+  x = gUnaryUnion(tile_polys, id = tile_polys$bairro_number)
+  
+  jdata = SpatialPolygonsDataFrame(Sr=x, 
+                                   data=data.frame(bairro_number = as.numeric(as.character(names(x)))),FALSE)
+  
+  return(jdata)
+}
+
+# Get voronoi tesselations
+dfv <- voronoi(shp = df)
+
+```
+
+## Results
+
+Having carried out the polygon delineation, we plot the results.
+
+```{r}
+# Plot in current state
+plot(dfv)
+plot(mag2, add = T, col = adjustcolor('blue', alpha.f = 0.2))
+```
+
+In the above, our methodology works well within Magude; but at borders, our neighborhoods expand infinitely outwards. In order to account for this, we can trim our polygons to keep only those segments which fall into Magude.
+
+```{r}
+# Narrow down so as to only keep those areas which are IN Magude
+proj4string(dfv) <- proj4string(mag2)
+out <- gIntersection(dfv, mag2, byid=TRUE)
+
+# Join with data
+row.names(out) <- as.character(1:length(out))
+out <- SpatialPolygonsDataFrame(out, data.frame(bairros), match.ID = TRUE)
+
+# Plot again
+plot(mag2, col = adjustcolor('red', alpha.f = 0.2))
+plot(out, add = T, lwd = 0.2)
+```
+
+The below interactive map allows for manual examination of neighborhoods.
+
+```{r}
+
+
+# Join in info on bairros
+dict$full_name <- paste0(dict$posto_administrativo,
+                         ': ',
+                         dict$bairro_name)
+out@data <- left_join(out@data,
+                      dict,
+                      by = 'bairro_number')
+bairros <- left_join(bairros,
+                     dict, 
+                     by = 'bairro_number')
+
+
+# Plot leaflet
+library(leaflet)
+leaflet() %>%
+  addProviderTiles(provider = 'Stamen.Toner') %>%
+  addPolygons(data = out,
+              color = 'green',
+              popup = out@data$bairro_name) 
+
+```
+
+## Data products
+
+Having finished our implementation of neighborhood delineation, we write a shapefile, so that others can use the neighborhoods, regardless of their GIS software.
+
+```{r}
+library(rgdal)
+writeOGR(obj=out, 
+         dsn="magude_bairros", 
+         layer = 'magude_bairros',
+         driver="ESRI Shapefile")
+```
+
+The standard shapefile components now exist in our `magude_bairros` directory:
+
+```{r}
+dir('magude_bairros/')
+```
+
+They are available for download at www.github.com/joebrew/magude_bairros/magude_bairros. Once human inspection confirms the validity of this approach^[Humberto and Bea?], I will make the `magude_bairros` object part of the CISM package.
